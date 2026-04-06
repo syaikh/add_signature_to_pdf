@@ -1,0 +1,7 @@
+.venv/
+*.pyc
+__pycache__/
+input/
+output/
+*.png
+transparent_*
