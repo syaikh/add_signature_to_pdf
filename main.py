@@ -626,7 +626,8 @@ def main() -> None:
         # Aspect ratio sekali saja dari PIL — tidak ada disk round-trip PyMuPDF
         aspect_ratio = _get_image_aspect_ratio(transparent_path)
 
-        workers = args.workers or min(8, os.cpu_count() or 4)
+        max_workers = min(8, os.cpu_count() or 4)
+        workers = min(args.workers or max_workers, len(pdf_paths))
         log.info(
             "Memproses %d PDF dengan %d worker(s)...",
             len(pdf_paths), workers,
