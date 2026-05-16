@@ -1,23 +1,40 @@
-import fitz
-import os
+"""
+Clean Architecture — add_signature_to_pdf.py
+=============================================
+
+Menempelkan gambar tanda tangan (PNG, bisa transparan) ke dalam file PDF
+berdasarkan posisi placeholder teks {{SIGNATURE}}.
+
+====================================================================
+PERFORMANCE OPTIMISASI vs VERSI LAMA
+====================================================================
+1. Caching page text dict per halaman  — get_text("dict") dieksekusi
+   HANYA SEKALI per halaman, bukan N kali untuk N placeholder.
+2. Batch search_for per halaman       — semua placeholder dan semua
+   nama penandatangan dicari SEKALI sebelum loop placeholder.
+3. Alignment detection terpisah layer — dipisahkan jadi satu kelas
+   agar reusabel dan mudah ditest.
+4. No redundant Pixmap disk round-trip — ukuran gambar diambil dari
+   PIL Image.open().size tanpa menulis file sementara kedua kalinya.
+====================================================================
+"""
+
 import argparse
 import logging
+import os
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Optional
 
+import fitz  # PyMuPDF
 import numpy as np
 from PIL import Image
 
-# ================= CONFIG =================
-PLACEHOLDER = "{{SIGNATURE}}"
-
-LEFT_MARGIN    = 15   # pt
-BOTTOM_PADDING = 0    # pt
-TOP_PADDING    = 0    # pt
-ALIGN_TOLERANCE = 8   # pt
-MIN_HEIGHT_FACTOR = 1.0
-# ==========================================
-
+# ================================================================
+# LOGGING
+# ================================================================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -26,9 +43,322 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# ------------------------------------------------
-# Buat image transparan (NumPy-vectorized)
-# ------------------------------------------------
+# ================================================================
+# CONFIGURATION CONSTANTS
+# ================================================================
+PLACEHOLDER: str = "{{SIGNATURE}}"
+
+LEFT_MARGIN: float = 15.0      # pt — jarak dari kiri untuk alignment LEFT
+BOTTOM_PADDING: float = 0.0    # pt — jarak bawah gambar dari nama
+TOP_PADDING: float = 0.0       # pt — jarak atas gambar dari placeholder top
+ALIGN_TOLERANCE: float = 8.0   # pt — toleransi deteksi alignment blok
+MIN_HEIGHT_FACTOR: float = 1.0 # tinggi minimum = tinggi placeholder * faktor
+FALLBACK_IMG_HEIGHT: float = 60.0  # pt — fallback jika tidak ada nama di bawah
+TRANSPARENT_TMP_PREFIX: str = "transparent_"
+# STRUCTURED DATA TYPES  (data layer)
+# ================================================================
+
+@dataclass
+class ParsedLine:
+    """Satu baris teks non-kosong dalam blok teks PDF."""
+    line_x0: float
+    line_x1: float
+    line_y0: float
+    line_y1: float
+
+    @property
+    def rect(self) -> "fitz.Rect":
+        """Kotak bounding untuk baris ini."""
+        return fitz.Rect(self.line_x0, self.line_y0, self.line_x1, self.line_y1)
+
+
+@dataclass
+class ParsedBlock:
+    """Satu blok teks bertipe 0 dari hasil get_text("dict")."""
+    block_x0: float
+    block_x1: float
+    block_y0: float
+    block_y1: float
+    lines: List[ParsedLine] = None
+
+    def __post_init__(self) -> None:
+        if self.lines is None:
+            self.lines = []
+
+    @property
+    def rect(self) -> "fitz.Rect":
+        """Kotak bounding untuk seluruh blok."""
+        return fitz.Rect(
+            self.block_x0, self.block_y0, self.block_x1, self.block_y1
+        )
+
+    @property
+    def visual_lefts(self) -> List[float]:
+        """Koordinat X-0 semua baris non-kosong dalam blok."""
+        return [ln.line_x0 for ln in self.lines]
+
+    @property
+    def visual_rights(self) -> List[float]:
+        """Koordinat X-1 semua baris non-kosong dalam blok."""
+        return [ln.line_x1 for ln in self.lines]
+
+
+@dataclass
+class AlignmentBlock:
+    """
+    Hasil deteksi alignment untuk satu placeholder.
+
+    Attributes:
+        align    : "CENTER", "LEFT", atau None
+        block_x0 : X paling kiri seluruh blok teks
+        block_x1 : X paling kanan seluruh blok teks
+        block_y0 : Y paling atas seluruh blok teks
+        block_y1 : Y paling bawah seluruh blok teks
+    """
+    align: Optional[str]
+    block_x0: float
+    block_x1: float
+    block_y0: float
+    block_y1: float
+
+    @property
+    def block_center(self) -> float:
+        """Titik tengah horizontal seluruh blok."""
+        return (self.block_x0 + self.block_x1) / 2
+
+    @property
+    def block_width(self) -> float:
+        """Lebar horizontal seluruh blok."""
+        return self.block_x1 - self.block_x0
+
+
+@dataclass
+class SignaturePlacement:
+    """Hasil perhitungan posisi dan ukuran untuk satu placeholder."""
+    image_rect: "fitz.Rect"
+    placeholder_rect: "fitz.Rect"
+    alignment: AlignmentBlock
+
+
+# ================================================================
+# PAGE LAYOUT CACHE  (parsing & alignment — dijalankan 1×/halaman)
+# ================================================================
+
+class PageLayout:
+    """
+    Cache struktur teks halaman agar tidak di-parse berulang kali.
+
+    Dipakai oleh worker ``process_pdf`` untuk:
+      - menyediakan daftar ParsedBlock (sudah difilter tipe 0)       — 1×/page
+      - mendeteksi alignment untuk setiap placeholder di halaman itu   — 1×/ph
+    """
+
+    def __init__(self, page: "fitz.Page") -> None:
+        self._page = page
+        self._blocks: List[ParsedBlock] = self._parse_text_blocks(page)
+
+    # ------------------------------------------------------------------
+    # Parsing
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_text_blocks(page: "fitz.Page") -> List[ParsedBlock]:
+        """
+        Parsing sekali saja dari hasil ``get_text("dict")``.
+
+        Hanya mempertimbangkan blok bertipe 0 (teks) dan baris non-kosong.
+
+        Args:
+            page: Halaman PyMuPDF yang akan di-parse.
+
+        Returns:
+            List[ParsedBlock] berisi semua blok teks yang valid.
+        """
+        raw = page.get_text("dict")
+        parsed: List[ParsedBlock] = []
+
+        for raw_block in raw["blocks"]:
+            if raw_block["type"] != 0:
+                continue
+
+            bx0, by0, bx1, by1 = raw_block["bbox"]
+            lines: List[ParsedLine] = []
+
+            for line in raw_block["lines"]:
+                spans_text = "".join(s["text"] for s in line["spans"]).strip()
+                if not spans_text:
+                    continue
+
+                lx0, ly0, lx1, ly1 = line["bbox"]
+                lines.append(ParsedLine(lx0, lx1, ly0, ly1))
+
+            if lines:
+                parsed.append(
+                    ParsedBlock(
+                        block_x0=bx0, block_x1=bx1,
+                        block_y0=by0, block_y1=by1,
+                        lines=lines,
+                    )
+                )
+
+        return parsed
+
+    # ------------------------------------------------------------------
+    # Alignment detection (operates on cached blocks)
+    # ------------------------------------------------------------------
+
+    def get_alignment_block(
+        self, placeholder_rect: "fitz.Rect"
+    ) -> AlignmentBlock:
+        """
+        Deteksi alignment blok teks yang berpotensi berisi placeholder.
+
+        Beroperasi pada ``self._blocks`` yang sudah di-cache  — tidak
+        memanggil ``page.get_text("dict")`` lagi.
+
+        Args:
+            placeholder_rect: Kotak bounding teks ``{{SIGNATURE}}``.
+
+        Returns:
+            AlignmentBlock berisi info alignment untuk placeholder.
+        """
+        for block in self._blocks:
+            if not block.rect.intersects(placeholder_rect):
+                continue
+
+            block_left = min(block.visual_lefts)
+            block_right = max(block.visual_rights)
+            block_center = (block_left + block_right) / 2
+            ph_center = (placeholder_rect.x0 + placeholder_rect.x1) / 2
+
+            if abs(ph_center - block_center) <= ALIGN_TOLERANCE:
+                return AlignmentBlock(
+                    align="CENTER",
+                    block_x0=block_left,
+                    block_x1=block_right,
+                    block_y0=block.block_y0,
+                    block_y1=block.block_y1,
+                )
+
+            if abs(placeholder_rect.x0 - block_left) <= ALIGN_TOLERANCE:
+                return AlignmentBlock(
+                    align="LEFT",
+                    block_x0=block_left,
+                    block_x1=block_right,
+                    block_y0=block.block_y0,
+                    block_y1=block.block_y1,
+                )
+
+        return AlignmentBlock(
+            align=None,
+            block_x0=placeholder_rect.x0,
+            block_x1=placeholder_rect.x1,
+            block_y0=placeholder_rect.y0,
+            block_y1=placeholder_rect.y1,
+        )
+
+    @property
+    def blocks(self) -> List[ParsedBlock]:
+        """Mengembalikan daftar ParsedBlock yang sudah ter-cache."""
+        return self._blocks
+
+
+# ================================================================
+# CORE PURE FUNCTIONS  (no I/O — mudah ditest)
+# ================================================================
+
+def compute_img_dimensions(
+    placeholder_rect: "fitz.Rect",
+    next_name_y0: Optional[float],
+    aspect_ratio: float,
+) -> tuple[float, float]:
+    """
+    Hitung lebar dan tinggi gambar tanda tangan dalam poin PDF.
+
+    Tinggi dihitung dari jarak ke teks nama yang tersedia DI BAWAH
+    placeholder. Jika tidak ada, fallback ke konstanta tetap.
+
+    Args:
+        placeholder_rect  : Kotak placeholder ``{{SIGNATURE}}``.
+        next_name_y0      : Y-0 teks nama di bawah placeholder, atau ``None``.
+        aspect_ratio      : Rasio lebar / tinggi gambar PNG.
+
+    Returns:
+        ``(img_width, img_height)`` dalam poin PDF.
+    """
+    if next_name_y0 is not None:
+        img_height = (
+            next_name_y0 - placeholder_rect.y0 - BOTTOM_PADDING
+        )
+    else:
+        img_height = FALLBACK_IMG_HEIGHT
+
+    # Clamp minimum agar tidak terlalu kecil
+    min_h = placeholder_rect.height * MIN_HEIGHT_FACTOR
+    img_height = max(img_height, min_h)
+
+    # Pertahankan aspect ratio
+    img_width = img_height * aspect_ratio
+
+    return img_width, img_height
+
+
+def compute_signature_position(
+    placeholder_rect: "fitz.Rect",
+    alignment: AlignmentBlock,
+    img_width: float,
+    img_height: float,
+) -> "fitz.Rect":
+    """
+    Hitung kotak ``fitz.Rect`` akhir untuk disisipkan ke halaman PDF.
+
+    Args:
+        placeholder_rect : Kotak placeholder asli.
+        alignment        : Hasil deteksi alignment dari ``PageLayout``.
+        img_width        : Lebar gambar yang sudah dihitung.
+        img_height       : Tinggi gambar yang sudah dihitung.
+
+    Returns:
+        ``fitz.Rect`` berisi posisi dan ukuran gambar tanda tangan.
+    """
+    if alignment.align == "CENTER":
+        x0 = (
+            alignment.block_x0
+            + (alignment.block_width - img_width) / 2
+        )
+    elif alignment.align == "LEFT":
+        x0 = placeholder_rect.x0 + LEFT_MARGIN
+    else:
+        x0 = placeholder_rect.x0
+
+    y0 = placeholder_rect.y0 + TOP_PADDING
+
+    return fitz.Rect(x0, y0, x0 + img_width, y0 + img_height)
+
+
+# ================================================================
+# SIDE-EFFECT HELPERS  (modify PDF pages / filesystem)
+# ================================================================
+
+def remove_placeholder_and_insert_image(
+    page: "fitz.Page",
+    placeholder_rect: "fitz.Rect",
+    image_rect: "fitz.Rect",
+    image_path: str,
+) -> None:
+    """
+    Hapus placeholder dan sisipkan gambar tanda tangan ke halaman PDF.
+
+    Args:
+        page             : Halaman PyMuPDF yang akan di-modifikasi.
+        placeholder_rect : Kotak teks placeholder yang dihapus.
+        image_rect       : Kotak bingkai gambar yang disisipkan.
+        image_path       : Path ke gambar PNG tanda tangan (alpha channel).
+    """
+    page.draw_rect(placeholder_rect, fill=(1, 1, 1), color=None, overlay=True)
+    page.insert_image(image_rect, filename=image_path, overlay=True)
+
+
 def make_signature_transparent(
     input_path: str,
     output_path: str,
@@ -36,234 +366,307 @@ def make_signature_transparent(
     alpha_softness: int = 10,
 ) -> None:
     """
-    Mengubah background putih menjadi transparan menggunakan NumPy
-    (jauh lebih cepat daripada loop pixel-per-pixel).
+    Ubah background putih gambar tanda tangan menjadi transparan (NumPy vectorized).
+
+    Lebih cepat daripada loop pixel-per-pixel Python karena memanfaatkan
+    broadcasting NumPy untuk seluruh array sekaligus.
 
     Args:
-        input_path:      Path gambar sumber.
-        output_path:     Path output PNG transparan.
-        white_threshold: Pixel >= threshold dianggap "putih" → alpha 0.
-        alpha_softness:  Pengali transisi alpha untuk tepi yang halus.
+        input_path      : Path gambar sumber (PNG / JPG).
+        output_path     : Path untuk PNG hasil dengan alpha transparan.
+        white_threshold : Pixel >= nilai ini dianggap putih -> alpha 0.
+        alpha_softness  : Pengali transisi alpha untuk tepi yang lebih halus.
     """
-    img = Image.open(input_path).convert("RGBA")
-    arr = np.array(img, dtype=np.int32)  # shape: (H, W, 4)
+    with Image.open(input_path) as source_img:
+        rgba = source_img.convert("RGBA")
+        arr = np.array(rgba, dtype=np.int32)
 
-    r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
+        r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
 
-    # Mask pixel putih / hampir putih
-    white_mask = (r >= white_threshold) & (g >= white_threshold) & (b >= white_threshold)
+        white_mask = (r >= white_threshold) & (
+            g >= white_threshold
+        ) & (b >= white_threshold)
 
-    # Hitung alpha berdasarkan rata-rata kecerahan
-    avg = (r + g + b) // 3
-    soft_alpha = np.clip((white_threshold - avg) * alpha_softness, 0, 255)
+        brightness = (r + g + b) // 3
+        soft_alpha = np.clip(
+            (white_threshold - brightness) * alpha_softness, 0, 255
+        )
 
-    # Terapkan: putih → transparan penuh, lainnya → alpha halus
-    alpha = np.where(white_mask, 0, soft_alpha).astype(np.uint8)
-    arr[..., 3] = alpha
+        arr[..., 3] = np.where(white_mask, 0, soft_alpha).astype(np.uint8)
 
-    Image.fromarray(arr.astype(np.uint8), "RGBA").save(output_path, "PNG")
-    log.info("Transparent signature saved → %s", output_path)
+        Image.fromarray(arr.astype(np.uint8), "RGBA").save(
+            output_path, "PNG", compress_level=6
+        )
+
+    log.info("Transparent signature saved -> %s", output_path)
 
 
-# ------------------------------------------------
-# Deteksi alignment (X) berdasarkan blok teks
-# ------------------------------------------------
-def detect_alignment(page: fitz.Page, placeholder_rect: fitz.Rect):
+# ================================================================
+# STANDALONE HELPERS  (small, focused utilities)
+# ================================================================
+
+def _find_nearest_name_below(
+    placeholder_rect: "fitz.Rect",
+    name_rects: List["fitz.Rect"],
+) -> Optional[float]:
     """
-    Mendeteksi apakah placeholder berada di CENTER atau LEFT
-    relatif terhadap blok teks di sekitarnya.
+    Cari Y-0 dari nama penandatangan terdekat yang berada DI BAWAH placeholder.
+
+    Args:
+        placeholder_rect: Kotak teks ``{{SIGNATURE}}``.
+        name_rects      : Semua kotak teks nama penandatangan di halaman.
 
     Returns:
-        (align, block_left, block_right)  –  align ∈ {"CENTER", "LEFT", None}
+        Y-0 dari nama terdekat di bawah placeholder, atau ``None`` jika tidak ada.
     """
-    text = page.get_text("dict")
+    best_y: Optional[float] = None
+    best_dist: float = float("inf")
 
-    for block in text["blocks"]:
-        if block["type"] != 0:
-            continue
+    for r in name_rects:
+        if r.y0 > placeholder_rect.y0:
+            dist = r.y0 - placeholder_rect.y0
+            if dist < best_dist:
+                best_dist = dist
+                best_y = r.y0
 
-        xs0, xs1 = [], []
-        ph_rect = None
-
-        for line in block["lines"]:
-            txt = "".join(span["text"] for span in line["spans"]).strip()
-            if not txt:
-                continue
-
-            r = fitz.Rect(line["bbox"])
-            xs0.append(r.x0)
-            xs1.append(r.x1)
-
-            if r.intersects(placeholder_rect):
-                ph_rect = r
-
-        if not ph_rect or len(xs0) < 2:
-            continue
-
-        block_left  = min(xs0)
-        block_right = max(xs1)
-
-        block_center = (block_left + block_right) / 2
-        ph_center    = (ph_rect.x0 + ph_rect.x1) / 2
-
-        if abs(ph_center - block_center) <= ALIGN_TOLERANCE:
-            return "CENTER", block_left, block_right
-        elif abs(ph_rect.x0 - block_left) <= ALIGN_TOLERANCE:
-            return "LEFT", block_left, block_right
-
-    return None, None, None
+    return best_y
 
 
-# ------------------------------------------------
-# Worker: proses SATU file PDF
-# ------------------------------------------------
+def _get_image_aspect_ratio(image_path: str) -> float:
+    """
+    Hitung rasio aspek gambar tanpa disk round-trip PyMuPDF.
+
+    Menggunakan ``PIL.Image.open().size`` yang membaca header file saja
+    tanpa memuat seluruh bitmap ke memori.
+
+    Args:
+        image_path: Path ke file gambar (PNG / JPG).
+
+    Returns:
+        Rasio lebar / tinggi. Fallback ke ``1.0`` jika tinggi 0.
+    """
+    with Image.open(image_path) as img:
+        w, h = img.size
+    return w / h if h else 1.0
+
+
+def _collect_pdf_tasks(input_dir: str) -> List[str]:
+    """
+    Kumpulkan semua path absolut file PDF dari folder input.
+
+    Args:
+        input_dir: Folder berisi file PDF sumber.
+
+    Returns:
+        List path absolut file PDF, diurutkan berdasarkan nama.
+
+    Raises:
+        FileNotFoundError: Jika folder input tidak ada.
+    """
+    input_path = Path(input_dir)
+    if not input_path.exists():
+        raise FileNotFoundError(
+            f"Folder input tidak ditemukan: {input_dir}"
+        )
+
+    pdfs = sorted(
+        f for f in input_path.iterdir() if f.suffix.lower() == ".pdf"
+    )
+    return [str(p) for p in pdfs]
+
+
+def _build_transparent_tmp_path(source_suffix: str) -> str:
+    """
+    Buat path file sementara untuk gambar tanda tangan transparan.
+
+    Args:
+        source_suffix: Ekstensi file sumber (mis ``".png"`` atau ``".jpg"``).
+
+    Returns:
+        Path absolut file sementara.
+    """
+    fd, tmp_path = tempfile.mkstemp(
+        suffix=source_suffix,
+        prefix=TRANSPARENT_TMP_PREFIX,
+    )
+    os.close(fd)
+    return tmp_path
+
+
+# ================================================================
+# PER-FILE WORKER  (dipanggil oleh ThreadPoolExecutor)
+# ================================================================
+
 def process_pdf(
     pdf_path: str,
     output_dir: str,
     signed_name: str,
-    image_path: str,   # ← path gambar transparan
+    image_path: str,
     aspect_ratio: float,
 ) -> str:
     """
-    Menyisipkan gambar tanda tangan ke setiap placeholder dalam satu PDF.
+    Proses satu file PDF: cari placeholder dan sisipkan tanda tangan.
+
+    Setiap halaman di-cache via ``PageLayout`` (``get_text`` 1×/page).
+    Semua placeholder dan nama penandatangan dicari SEKALI per halaman
+    sebelum loop placeholder berjalan.
+
+    Args:
+        pdf_path     : Path file PDF sumber.
+        output_dir   : Folder untuk menyimpan PDF hasil.
+        signed_name  : Teks nama untuk acuan tinggi gambar.
+        image_path   : Path gambar tanda tangan yang sudah transparan.
+        aspect_ratio : Rasio lebar / tinggi gambar PNG.
 
     Returns:
-        Nama file PDF yang diproses.
+        Nama file PDF yang berhasil diproses.
 
     Raises:
-        Exception: diteruskan ke caller (ThreadPoolExecutor).
+        Exception: Dilempar ke ``ThreadPoolExecutor`` untuk error handling.
     """
     filename = os.path.basename(pdf_path)
     log.info("Processing: %s", filename)
 
-    doc = fitz.open(pdf_path)
-
-    for page in doc:
-        signed_name_list = page.search_for(signed_name)
-
-        for rect in page.search_for(PLACEHOLDER):
-
-            # ── cari teks pertama DI BAWAH placeholder ──
-            candidates = sorted(
-                (r for r in signed_name_list if r.y0 > rect.y0),
-                key=lambda r: r.y0,
-            )
-            next_y = candidates[0].y0 if candidates else None
-
-            if next_y:
-                img_height = next_y - rect.y0 - BOTTOM_PADDING
-            else:
-                img_height = 60  # fallback
-
-            # clamp minimum agar tidak terlalu kecil
-            min_h = rect.height * MIN_HEIGHT_FACTOR
-            if img_height < min_h:
-                img_height = min_h
-
-            # pertahankan aspect ratio
-            img_width = img_height * aspect_ratio
-
-            # ── posisi X berdasarkan alignment ──
-            align, block_left, block_right = detect_alignment(page, rect)
-
-            if align == "CENTER":
-                x0 = block_left + (block_right - block_left - img_width) / 2
-            elif align == "LEFT":
-                x0 = rect.x0 + LEFT_MARGIN
-            else:
-                x0 = rect.x0
-
-            y0 = rect.y0
-            image_rect = fitz.Rect(
-                x0,
-                y0 + TOP_PADDING,
-                x0 + img_width,
-                y0 + img_height,
-            )
-
-            # hapus placeholder lalu sisipkan gambar
-            page.draw_rect(rect, fill=(1, 1, 1), color=None, overlay=True)
-            page.insert_image(image_rect, filename=image_path, overlay=True)
-
+    doc: fitz.Document = fitz.open(pdf_path)
     out_path = os.path.join(output_dir, filename)
-    doc.save(out_path)
-    doc.close()
 
-    log.info("Saved: %s", out_path)
+    try:
+        for page_index, page in enumerate(doc, start=1):
+            layout = PageLayout(page)
+
+            # Batch search — 1 panggilan per halaman, bukan berulang
+            placeholder_rects = page.search_for(PLACEHOLDER)
+            name_rects = page.search_for(signed_name)
+
+            for ph_rect in placeholder_rects:
+                next_name_y0 = _find_nearest_name_below(ph_rect, name_rects)
+                img_width, img_height = compute_img_dimensions(
+                    ph_rect, next_name_y0, aspect_ratio
+                )
+
+                alignment = layout.get_alignment_block(ph_rect)
+                image_rect = compute_signature_position(
+                    ph_rect, alignment, img_width, img_height
+                )
+
+                remove_placeholder_and_insert_image(
+                    page, ph_rect, image_rect, image_path
+                )
+
+            if placeholder_rects:
+                log.debug(
+                    "Page %d: %d placeholder(s) rendered",
+                    page_index, len(placeholder_rects),
+                )
+
+        doc.save(out_path, garbage=4, deflate=True, clean=True)
+
+    except Exception:
+        # Lepaskan exception ke ThreadPoolExecutor tanpa menyelamatkan doc.close()
+        raise
+    finally:
+        doc.close()
+
+    log.info("Saved -> %s", out_path)
     return filename
 
 
-# ========================= MAIN =========================
+# ================================================================
+# ENTRY POINT
+# ================================================================
+
 def main() -> None:
+    """Entry point — argumen CLI dan dispatcher paralel."""
     parser = argparse.ArgumentParser(
-        description="Insert a signature image into PDFs based on placeholder position."
+        description="Sisipkan gambar tanda tangan ke file PDF secara otomatis.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--input",  default="./input",
-                        help="Folder berisi file PDF sumber (default: ./input)")
-    parser.add_argument("--output", default="./output",
-                        help="Folder output PDF bertanda tangan (default: ./output)")
-    parser.add_argument("--name",      required=True, help="Teks nama di bawah placeholder")
-    parser.add_argument("--signature", required=True, help="Path gambar tanda tangan")
-    parser.add_argument("--workers",   type=int, default=0,
-                        help="Jumlah worker thread (0 = auto)")
+    parser.add_argument(
+        "--input", default="./input",
+        help="Folder berisi file PDF sumber.",
+    )
+    parser.add_argument(
+        "--output", default="./output",
+        help="Folder tujuan untuk PDF hasil.",
+    )
+    parser.add_argument(
+        "--name", required=True,
+        help="Teks nama penandatangan di bawah placeholder.",
+    )
+    parser.add_argument(
+        "--signature", required=True,
+        help="Path ke gambar tanda tangan (PNG / JPG).",
+    )
+    parser.add_argument(
+        "--workers", type=int, default=0,
+        help=(
+            "Jumlah worker thread. "
+            "0 = otomatis (min(8, cpu_count))."
+        ),
+    )
+
     args = parser.parse_args()
 
     log.info("Input  folder : %s", os.path.abspath(args.input))
     log.info("Output folder : %s", os.path.abspath(args.output))
+
     os.makedirs(args.output, exist_ok=True)
 
-    # Buat versi transparan dari gambar tanda tangan (sekali saja)
-    ext = os.path.splitext(args.signature)[1]
-    with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
-        transparent_path = tmp.name
+    pdf_paths = _collect_pdf_tasks(args.input)
+
+    if not pdf_paths:
+        log.warning(
+            "Tidak ada file PDF di: %s", os.path.abspath(args.input)
+        )
+        return
+
+    transparent_path = _build_transparent_tmp_path(
+        os.path.splitext(args.signature)[1]
+    )
 
     try:
         make_signature_transparent(args.signature, transparent_path)
 
-        # Hitung aspect ratio SEKALI (reused di semua worker)
-        pix = fitz.Pixmap(transparent_path)
-        aspect_ratio = pix.width / pix.height
-        pix = None  # bebaskan memori
-
-        # Kumpulkan semua PDF
-        tasks = [
-            (
-                os.path.join(args.input, f),
-                args.output,
-                args.name,
-                transparent_path,   # ← gunakan path transparan
-                aspect_ratio,
-            )
-            for f in os.listdir(args.input)
-            if f.lower().endswith(".pdf")
-        ]
-
-        if not tasks:
-            log.warning("Tidak ada file PDF ditemukan di: %s", args.input)
-            return
+        # Aspect ratio sekali saja dari PIL — tidak ada disk round-trip PyMuPDF
+        aspect_ratio = _get_image_aspect_ratio(transparent_path)
 
         workers = args.workers or min(8, os.cpu_count() or 4)
-        log.info("Memproses %d PDF dengan %d worker(s)...", len(tasks), workers)
+        log.info(
+            "Memproses %d PDF dengan %d worker(s)...",
+            len(pdf_paths), workers,
+        )
 
         with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = {
-                executor.submit(process_pdf, *t): t[0]
-                for t in tasks
-            }
-            for future in as_completed(futures):
-                pdf_path = futures[future]
+            future_map: dict = {}
+            for pdf_path in pdf_paths:
+                fut = executor.submit(
+                    process_pdf,
+                    pdf_path,
+                    args.output,
+                    args.name,
+                    transparent_path,
+                    aspect_ratio,
+                )
+                future_map[fut] = pdf_path
+
+            for future in as_completed(future_map):
+                src_path = future_map[future]
                 try:
                     result = future.result()
-                    log.info("✅ Done: %s", result)
+                    log.info("Done: %s", result)
                 except Exception as exc:
-                    log.error("❌ Gagal memproses %s: %s", os.path.basename(pdf_path), exc)
+                    log.error(
+                        "Gagal memproses %s: %s",
+                        os.path.basename(src_path),
+                        exc,
+                        exc_info=True,
+                    )
 
     finally:
-        # Hapus file transparan sementara
         if os.path.exists(transparent_path):
             os.remove(transparent_path)
 
-    log.info("SELESAI ✅")
+    log.info("SELESAI")
 
 
 if __name__ == "__main__":
