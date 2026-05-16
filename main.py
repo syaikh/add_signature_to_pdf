@@ -24,9 +24,9 @@ import logging
 import os
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import fitz  # PyMuPDF
 import numpy as np
@@ -79,11 +79,7 @@ class ParsedBlock:
     block_x1: float
     block_y0: float
     block_y1: float
-    lines: List[ParsedLine] = None
-
-    def __post_init__(self) -> None:
-        if self.lines is None:
-            self.lines = []
+    lines: List[ParsedLine] = field(default_factory=list)
 
     @property
     def rect(self) -> "fitz.Rect":
@@ -174,18 +170,18 @@ class PageLayout:
         Returns:
             List[ParsedBlock] berisi semua blok teks yang valid.
         """
-        raw = page.get_text("dict")
+        raw: Any = page.get_text("dict")
         parsed: List[ParsedBlock] = []
 
         for raw_block in raw["blocks"]:
-            if raw_block["type"] != 0:
+            if raw_block.get("type") != 0:
                 continue
 
             bx0, by0, bx1, by1 = raw_block["bbox"]
             lines: List[ParsedLine] = []
 
-            for line in raw_block["lines"]:
-                spans_text = "".join(s["text"] for s in line["spans"]).strip()
+            for line in raw_block.get("lines", []):
+                spans_text = "".join(s["text"] for s in line.get("spans", [])).strip()
                 if not spans_text:
                     continue
 
@@ -531,7 +527,7 @@ def process_pdf(
     out_path = os.path.join(output_dir, filename)
 
     try:
-        for page_index, page in enumerate(doc, start=1):
+        for page_index, page in enumerate(doc.pages(), start=1):
             layout = PageLayout(page)
 
             # Batch search — 1 panggilan per halaman, bukan berulang
