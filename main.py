@@ -370,28 +370,46 @@ def make_signature_transparent(
     Args:
         input_path      : Path gambar sumber (PNG / JPG).
         output_path     : Path untuk PNG hasil dengan alpha transparan.
-        white_threshold : Pixel >= nilai ini dianggap putih -> alpha 0.
-        alpha_softness  : Pengali transisi alpha untuk tepi yang lebih halus.
+        white_threshold : Batas putih untuk transparansi penuh.
+        alpha_softness  : Jarak transisi alpha di bawah ambang putih.
     """
     with Image.open(input_path) as source_img:
         rgba = source_img.convert("RGBA")
-        arr = np.array(rgba, dtype=np.int32)
+        arr = np.array(rgba, dtype=np.uint8)
 
         r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
 
         white_mask = (r >= white_threshold) & (
             g >= white_threshold
         ) & (b >= white_threshold)
-
-        brightness = (r + g + b) // 3
-        soft_alpha = np.clip(
-            (white_threshold - brightness) * alpha_softness, 0, 255
+        fade_zone = (
+            (r >= white_threshold - alpha_softness)
+            & (g >= white_threshold - alpha_softness)
+            & (b >= white_threshold - alpha_softness)
+            & ~white_mask
         )
 
-        arr[..., 3] = np.where(white_mask, 0, soft_alpha).astype(np.uint8)
+        alpha = np.full(r.shape, 255, dtype=np.uint8)
+        alpha[white_mask] = 0
 
-        Image.fromarray(arr.astype(np.uint8), "RGBA").save(
-            output_path, "PNG", compress_level=6
+        if alpha_softness > 0 and np.any(fade_zone):
+            fade_distance = np.minimum.reduce(
+                (
+                    white_threshold - r[fade_zone],
+                    white_threshold - g[fade_zone],
+                    white_threshold - b[fade_zone],
+                )
+            ).astype(np.int32)
+            alpha[fade_zone] = np.clip(
+                (fade_distance * 255) // alpha_softness,
+                0,
+                255,
+            ).astype(np.uint8)
+
+        arr[..., 3] = alpha
+
+        Image.fromarray(arr, "RGBA").save(
+            output_path, format="PNG", compress_level=6
         )
 
     log.info("Transparent signature saved -> %s", output_path)
@@ -471,18 +489,15 @@ def _collect_pdf_tasks(input_dir: str) -> List[str]:
     return [str(p) for p in pdfs]
 
 
-def _build_transparent_tmp_path(source_suffix: str) -> str:
+def _build_transparent_tmp_path() -> str:
     """
     Buat path file sementara untuk gambar tanda tangan transparan.
-
-    Args:
-        source_suffix: Ekstensi file sumber (mis ``".png"`` atau ``".jpg"``).
 
     Returns:
         Path absolut file sementara.
     """
     fd, tmp_path = tempfile.mkstemp(
-        suffix=source_suffix,
+        suffix=".png",
         prefix=TRANSPARENT_TMP_PREFIX,
     )
     os.close(fd)
@@ -616,9 +631,7 @@ def main() -> None:
         )
         return
 
-    transparent_path = _build_transparent_tmp_path(
-        os.path.splitext(args.signature)[1]
-    )
+    transparent_path = _build_transparent_tmp_path()
 
     try:
         make_signature_transparent(args.signature, transparent_path)
@@ -626,8 +639,12 @@ def main() -> None:
         # Aspect ratio sekali saja dari PIL — tidak ada disk round-trip PyMuPDF
         aspect_ratio = _get_image_aspect_ratio(transparent_path)
 
-        max_workers = min(8, os.cpu_count() or 4)
-        workers = min(args.workers or max_workers, len(pdf_paths))
+        cpu_count = os.cpu_count() or 4
+        max_workers = min(8, cpu_count)
+        workers = min(
+            args.workers if args.workers > 0 else max_workers,
+            len(pdf_paths),
+        )
         log.info(
             "Memproses %d PDF dengan %d worker(s)...",
             len(pdf_paths), workers,
