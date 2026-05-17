@@ -3,6 +3,7 @@ import os
 import argparse
 import logging
 import tempfile
+import bisect
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
@@ -76,7 +77,15 @@ def detect_alignment(page: fitz.Page, placeholder_rect: fitz.Rect):
     Returns:
         (align, block_left, block_right)  –  align ∈ {"CENTER", "LEFT", None}
     """
-    text = page.get_text("dict")
+    # Expand rectangle slightly to capture surrounding text for better alignment detection
+    expand = 20  # points
+    expanded_rect = fitz.Rect(
+        placeholder_rect.x0 - expand,
+        placeholder_rect.y0 - expand,
+        placeholder_rect.x1 + expand,
+        placeholder_rect.y1 + expand
+    )
+    text = page.get_text("dict", clip=expanded_rect)
 
     for block in text["blocks"]:
         if block["type"] != 0:
@@ -140,15 +149,17 @@ def process_pdf(
 
     for page in doc:
         signed_name_list = page.search_for(signed_name)
+        # Sort once by y0 for efficient lookup
+        signed_name_list.sort(key=lambda r: r.y0)
+        y0_list = [r.y0 for r in signed_name_list]
 
         for rect in page.search_for(PLACEHOLDER):
-
-            # ── cari teks pertama DI BAWAH placeholder ──
-            candidates = sorted(
-                (r for r in signed_name_list if r.y0 > rect.y0),
-                key=lambda r: r.y0,
-            )
-            next_y = candidates[0].y0 if candidates else None
+            # ── cari teks pertama DI BAWAH placeholder (menggunakan binary search) ──
+            idx = bisect.bisect_right(y0_list, rect.y0)  # first y0 > rect.y0
+            if idx < len(y0_list):
+                next_y = y0_list[idx]
+            else:
+                next_y = None
 
             if next_y:
                 img_height = next_y - rect.y0 - BOTTOM_PADDING
