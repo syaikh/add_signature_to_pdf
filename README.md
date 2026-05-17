@@ -72,9 +72,25 @@ python main.py \
 add_signature_to_pdf/
 ├── main.py           # Script utama
 ├── README.md         # Dokumentasi ini
+├── test_main.py      # Smoke test untuk CLI dan helper utama
 ├── pdf_input/        # Contoh: folder PDF sumber (buat sendiri)
 └── pdf_output/       # Contoh: folder output (dibuat otomatis)
 ```
+
+---
+
+## 🧪 Testing
+
+Smoke test dijalankan dengan:
+
+```bash
+python -m unittest test_main.py
+```
+
+Test ini memverifikasi:
+- `main._get_image_aspect_ratio()`
+- `main.make_signature_transparent()`
+- behavior CLI ketika folder input kosong
 
 ---
 
