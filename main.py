@@ -275,7 +275,7 @@ def compute_img_dimensions(
     Tinggi dihitung dari bagian ATAS teks di atas placeholder hingga
     bagian BAWAH teks nama di bawah, dengan penyesuaian margin.
 
-    Jika tidak ada teks di atas, gunakan fallback ke konstanta tetap.
+    Jika tidak ada nama di bawah, gunakan tinggi placeholder sebagai minimum.
 
     Args:
         placeholder_rect  : Kotak placeholder ``{{SIGNATURE}}``.
@@ -447,7 +447,7 @@ def _find_nearest_text_above(
     best_dist: float = float("inf")
 
     for r in text_rects:
-        if r.y1 <= placeholder_rect.y0:
+        if r.y1 <= placeholder_rect.y0 and (placeholder_rect.y0 - r.y1) > 5:
             dist = placeholder_rect.y0 - r.y1
             if dist < best_dist:
                 best_dist = dist
