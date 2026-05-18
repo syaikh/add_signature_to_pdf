@@ -265,35 +265,37 @@ class PageLayout:
 
 def compute_img_dimensions(
     placeholder_rect: "fitz.Rect",
-    next_name_y0: Optional[float],
+    text_above_rect: Optional["fitz.Rect"],
+    name_rect: Optional["fitz.Rect"],
     aspect_ratio: float,
 ) -> tuple[float, float]:
     """
     Hitung lebar dan tinggi gambar tanda tangan dalam poin PDF.
 
-    Tinggi dihitung dari jarak ke teks nama yang tersedia DI BAWAH
-    placeholder. Jika tidak ada, fallback ke konstanta tetap.
+    Tinggi dihitung dari bagian ATAS teks di atas placeholder hingga
+    bagian BAWAH teks nama di bawah, dengan penyesuaian margin.
+
+    Jika tidak ada teks di atas, gunakan fallback ke konstanta tetap.
 
     Args:
         placeholder_rect  : Kotak placeholder ``{{SIGNATURE}}``.
-        next_name_y0      : Y-0 teks nama di bawah placeholder, atau ``None``.
+        text_above_rect   : Rect teks di atas placeholder (jika ada).
+        name_rect         : Rect nama penandatangan di bawah (jika ada).
         aspect_ratio      : Rasio lebar / tinggi gambar PNG.
 
     Returns:
         ``(img_width, img_height)`` dalam poin PDF.
     """
-    if next_name_y0 is not None:
-        img_height = (
-            next_name_y0 - placeholder_rect.y0 - BOTTOM_PADDING
-        )
+    if text_above_rect is not None and name_rect is not None:
+        img_height = (name_rect.y0 - text_above_rect.y1) - BOTTOM_PADDING
+    elif name_rect is not None:
+        img_height = (name_rect.y0 - placeholder_rect.y0) - BOTTOM_PADDING
     else:
         img_height = FALLBACK_IMG_HEIGHT
 
-    # Clamp minimum agar tidak terlalu kecil
     min_h = placeholder_rect.height * MIN_HEIGHT_FACTOR
     img_height = max(img_height, min_h)
 
-    # Pertahankan aspect ratio
     img_width = img_height * aspect_ratio
 
     return img_width, img_height
@@ -301,6 +303,7 @@ def compute_img_dimensions(
 
 def compute_signature_position(
     placeholder_rect: "fitz.Rect",
+    text_above_rect: Optional["fitz.Rect"],
     alignment: AlignmentBlock,
     img_width: float,
     img_height: float,
@@ -308,8 +311,12 @@ def compute_signature_position(
     """
     Hitung kotak ``fitz.Rect`` akhir untuk disisipkan ke halaman PDF.
 
+    Titik atas gambar dihitung dari bagian bawah teks di atas placeholder
+    jika ada, sehingga gambar dimulai tepat di bawah teks tersebut.
+
     Args:
         placeholder_rect : Kotak placeholder asli.
+        text_above_rect  : Rect teks di atas placeholder (jika ada).
         alignment        : Hasil deteksi alignment dari ``PageLayout``.
         img_width        : Lebar gambar yang sudah dihitung.
         img_height       : Tinggi gambar yang sudah dihitung.
@@ -327,7 +334,10 @@ def compute_signature_position(
     else:
         x0 = placeholder_rect.x0
 
-    y0 = placeholder_rect.y0 + TOP_PADDING
+    if text_above_rect is not None:
+        y0 = text_above_rect.y1 + TOP_PADDING
+    else:
+        y0 = placeholder_rect.y0 + TOP_PADDING
 
     return fitz.Rect(x0, y0, x0 + img_width, y0 + img_height)
 
@@ -419,21 +429,48 @@ def make_signature_transparent(
 # STANDALONE HELPERS  (small, focused utilities)
 # ================================================================
 
-def _find_nearest_name_below(
+def _find_nearest_text_above(
+    placeholder_rect: "fitz.Rect",
+    text_rects: List["fitz.Rect"],
+) -> Optional["fitz.Rect"]:
+    """
+    Cari rect teks terdekat yang berada DI ATAS placeholder.
+
+    Args:
+        placeholder_rect: Kotak teks ``{{SIGNATURE}}``.
+        text_rects      : Semua kotak teks di halaman (hasil search_for).
+
+    Returns:
+        Rect teks terdekat di atas placeholder, atau ``None`` jika tidak ada.
+    """
+    best_rect: Optional["fitz.Rect"] = None
+    best_dist: float = float("inf")
+
+    for r in text_rects:
+        if r.y1 <= placeholder_rect.y0:
+            dist = placeholder_rect.y0 - r.y1
+            if dist < best_dist:
+                best_dist = dist
+                best_rect = r
+
+    return best_rect
+
+
+def _find_nearest_rect_below(
     placeholder_rect: "fitz.Rect",
     name_rects: List["fitz.Rect"],
-) -> Optional[float]:
+) -> Optional["fitz.Rect"]:
     """
-    Cari Y-0 dari nama penandatangan terdekat yang berada DI BAWAH placeholder.
+    Cari rect nama penandatangan terdekat yang berada DI BAWAH placeholder.
 
     Args:
         placeholder_rect: Kotak teks ``{{SIGNATURE}}``.
         name_rects      : Semua kotak teks nama penandatangan di halaman.
 
     Returns:
-        Y-0 dari nama terdekat di bawah placeholder, atau ``None`` jika tidak ada.
+        Rect nama terdekat di bawah placeholder, atau ``None`` jika tidak ada.
     """
-    best_y: Optional[float] = None
+    best_rect: Optional["fitz.Rect"] = None
     best_dist: float = float("inf")
 
     for r in name_rects:
@@ -441,9 +478,9 @@ def _find_nearest_name_below(
             dist = r.y0 - placeholder_rect.y0
             if dist < best_dist:
                 best_dist = dist
-                best_y = r.y0
+                best_rect = r
 
-    return best_y
+    return best_rect
 
 
 def _get_image_aspect_ratio(image_path: str) -> float:
@@ -549,15 +586,22 @@ def process_pdf(
             placeholder_rects = page.search_for(PLACEHOLDER)
             name_rects = page.search_for(signed_name)
 
+            # Collect all text rects for finding text above placeholder
+            all_text_rects = []
+            for block in layout.blocks:
+                for line in block.lines:
+                    all_text_rects.append(line.rect)
+
             for ph_rect in placeholder_rects:
-                next_name_y0 = _find_nearest_name_below(ph_rect, name_rects)
+                text_above_rect = _find_nearest_text_above(ph_rect, all_text_rects)
+                name_rect = _find_nearest_rect_below(ph_rect, name_rects)
                 img_width, img_height = compute_img_dimensions(
-                    ph_rect, next_name_y0, aspect_ratio
+                    ph_rect, text_above_rect, name_rect, aspect_ratio
                 )
 
                 alignment = layout.get_alignment_block(ph_rect)
                 image_rect = compute_signature_position(
-                    ph_rect, alignment, img_width, img_height
+                    ph_rect, text_above_rect, alignment, img_width, img_height
                 )
 
                 remove_placeholder_and_insert_image(
