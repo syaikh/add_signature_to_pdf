@@ -11,6 +11,7 @@ Script Python untuk menyisipkan gambar tanda tangan ke dalam file PDF secara oto
 - 📐 **Auto-alignment** — mendeteksi apakah tanda tangan harus rata kiri atau rata tengah
 - ⚡ **Pemrosesan paralel** — menggunakan `ThreadPoolExecutor` untuk memproses banyak PDF secara bersamaan
 - 📏 **Aspect ratio preserved** — ukuran tanda tangan mengikuti jarak ke teks nama di bawahnya
+- ⚖️ **Balanced margins** — margin atas dan bawah gambar dijamin 5pt yang sama
 - 🪵 **Logging terstruktur** — output yang jelas dengan timestamp
 
 ---
@@ -104,9 +105,10 @@ PDF Input
    │
    ├── Cari teks {{SIGNATURE}}
    │       │
-   │       ├── Ukur jarak ke nama di bawahnya → tentukan tinggi gambar
+   │       ├── Cari ruang di atas dan bawah placeholder
+   │       ├── Hitung tinggi agar margin 5pt + 5pt
    │       ├── Deteksi alignment (CENTER / LEFT)
-   │       ├── Hapus placeholder (kotak putih)
+   │       ├── Hapus placeholder (redaction putih)
    │       └── Sisipkan gambar tanda tangan transparan
    │
    └── Simpan ke folder output
@@ -117,21 +119,25 @@ PDF Input
 Tempatkan teks `{{SIGNATURE}}` di dokumen Word/PDF Anda persis di posisi tanda tangan yang diinginkan. Script akan:
 
 1. Menemukan posisi `{{SIGNATURE}}`
-2. Menghapusnya (ditimpa warna putih)
-3. Menyisipkan gambar tanda tangan di lokasi tersebut
+2. Mendeteksi ruang kosong di atas dan di bawah placeholder
+3. Menghitung tinggi gambar agar margin atas dan bawah = 5pt
+4. Menghapus placeholder (redaction putih)
+5. Menyisipkan gambar tanda tangan di lokasi yang dihitung
 
 ---
 
 ## 🔧 Konfigurasi (di dalam `main.py`)
 
-| Konstanta          | Default | Keterangan                                              |
-|--------------------|---------|---------------------------------------------------------|
-| `PLACEHOLDER`      | `{{SIGNATURE}}` | Teks penanda posisi tanda tangan              |
-| `LEFT_MARGIN`      | `15` pt | Jarak dari kiri saat alignment LEFT                 |
-| `BOTTOM_PADDING`   | `0` pt  | Padding bawah gambar                                |
-| `TOP_PADDING`      | `0` pt  | Padding atas gambar                                 |
-| `ALIGN_TOLERANCE`  | `8` pt  | Toleransi piksel untuk deteksi alignment            |
-| `MIN_HEIGHT_FACTOR`| `1.0`   | Tinggi minimum gambar = tinggi placeholder × faktor |
+| Konstanta           | Default | Keterangan                                              |
+ |--------------------|---------|---------------------------------------------------------|
+ | `PLACEHOLDER`      | `{{SIGNATURE}}` | Teks penanda posisi tanda tangan              |
+ | `LEFT_MARGIN`      | `15` pt | Jarak dari kiri saat alignment LEFT                 |
+ | `SPACE_HEIGHT_FACTOR`| `0.90`  | Persentase tinggi ruang yang dipakai (90%)          |
+ | `SPACE_TOP_MARGIN` | `2` pt  | Margin di atas ruang gambar                        |
+ | `SPACE_BOTTOM_MARGIN`| `2` pt  | Margin di bawah ruang gambar                       |
+ | `TOP_PADDING`      | `2` pt  | Padding atas gambar jika tidak ada ruang          |
+ | `ALIGN_TOLERANCE`  | `8` pt  | Toleransi piksel untuk deteksi alignment           |
+ | `MIN_HEIGHT_FACTOR`| `1.0`   | Tinggi minimum gambar = tinggi placeholder × faktor |
 
 ---
 
@@ -140,6 +146,7 @@ Tempatkan teks `{{SIGNATURE}}` di dokumen Word/PDF Anda persis di posisi tanda t
 - Gambar tanda tangan sebaiknya berlatar putih atau transparan.
 - Script akan membuat versi transparan dari gambar tanda tangan secara otomatis di folder temp sistem, dan menghapusnya setelah selesai.
 - Jika tidak ada teks nama di bawah placeholder, tinggi gambar akan di-fallback ke **60 pt**.
+- Margin atas dan bawah gambar secara otomatis dihitung untuk **5pt yang sama** di kedua sisi.
 - Script aman dijalankan berulang kali — folder output dibuat otomatis jika belum ada.
 
 ---
