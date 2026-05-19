@@ -2,14 +2,20 @@
 # Automatically activates venv and runs with default/interactive parameters
 
 param(
-    [string]$InputDir = "./input",
-    [string]$OutputDir = "./output",
-    [string]$Name = "hulyatun maskunah",
-    [string]$Signature = "./hulya_signature.jpeg"
+    [string]$InputDir = "",
+    [string]$OutputDir = "",
+    [string]$Name = "",
+    [string]$Signature = ""
 )
 
 # Get script directory
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+
+# Default values
+$DefaultInput = ".\input"
+$DefaultOutput = ".\output"
+$DefaultName = "hulyatun maskunah"
+$DefaultSignature = ".\hulya_signature.jpeg"
 
 # Use python directly from venv to avoid activation scope issues
 $PythonExe = Join-Path $ScriptDir ".venv\Scripts\python.exe"
@@ -32,14 +38,25 @@ function Read-WithDefault {
 }
 
 # Interactive mode if no arguments provided
+$Interactive = $false
 if ($args.Count -eq 0 -or $args[0] -eq "-Interactive") {
+    $Interactive = $true
+}
+
+if ($Interactive) {
     Write-Host "=== Signature PDF Tool ===" -ForegroundColor Cyan
     Write-Host ""
 
-    $InputDir = Read-WithDefault -Prompt "Input folder path" -DefaultValue $InputDir
-    $OutputDir = Read-WithDefault -Prompt "Output folder path" -DefaultValue $OutputDir
-    $Name = Read-WithDefault -Prompt "Signature name" -DefaultValue $Name
-    $Signature = Read-WithDefault -Prompt "Signature image path" -DefaultValue $Signature
+    $InputDir = Read-WithDefault -Prompt "Input folder path" -DefaultValue $DefaultInput
+    $OutputDir = Read-WithDefault -Prompt "Output folder path" -DefaultValue $DefaultOutput
+    $Name = Read-WithDefault -Prompt "Signature name" -DefaultValue $DefaultName
+    $Signature = Read-WithDefault -Prompt "Signature image path" -DefaultValue $DefaultSignature
+} else {
+    # Use provided values or defaults
+    if ([string]::IsNullOrWhiteSpace($InputDir)) { $InputDir = $DefaultInput }
+    if ([string]::IsNullOrWhiteSpace($OutputDir)) { $OutputDir = $DefaultOutput }
+    if ([string]::IsNullOrWhiteSpace($Name)) { $Name = $DefaultName }
+    if ([string]::IsNullOrWhiteSpace($Signature)) { $Signature = $DefaultSignature }
 }
 
 $mainScript = Join-Path $ScriptDir "main.py"
